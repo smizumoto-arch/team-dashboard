@@ -1,11 +1,10 @@
 // ============================================================
-// ステップ3: ダッシュボード本体（既存UI + Firestore CRUD）
+// ダッシュボード本体（メンバー動的管理 + タスク編集 + 行動指針）
 // ------------------------------------------------------------
-// データ構造: users/{uid}/tasks/{taskId}
-//   { name, assignee, due, status, priority, createdAt }
-// ・onSnapshot でリアルタイム取得
-// ・addDoc / updateDoc / deleteDoc で 追加・更新・削除
-// ・初回ログイン時、タスクが空ならサンプルデータを自動投入
+// Firestore データ構造:
+//   users/{uid}/tasks/{taskId}  { name, assignee, due, status, priority, createdAt }
+//   users/{uid}/meta/app        { seeded, members: string[], guideline: string }
+// すべて onSnapshot でリアルタイム購読。将来のDB連携をそのまま見据えた構造。
 // ============================================================
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -16,21 +15,21 @@ import {
   LayoutDashboard, Layers, List, Plus, PlusCircle, Calendar, CalendarDays,
   Trash2, AlertCircle, AlertTriangle, CheckCircle2, Loader, ListTodo, Users,
   Building2, HelpCircle, ChevronsUp, ChevronUp, ChevronDown, Inbox, LogOut,
+  Pencil, X, UserCog, Save, Target,
 } from 'lucide-react';
 import { db } from '../firebase';
 import { useAuth } from '../auth/AuthContext';
 
 /* ===================== 定数・マスタ ===================== */
-const MEMBERS = ['営業A', '営業B', '営業C'];
-const ASSIGNEES = ['全体', '営業A', '営業B', '営業C', '未定'];
+const DEFAULT_MEMBERS = ['営業A', '営業B', '営業C'];
+const SPECIAL = ['全体', '未定']; // メンバーではない特別な担当区分
 
-const ASSIGNEE_META = {
-  '全体':  { short: '全', accent: 'bg-violet-500' },
-  '営業A': { short: 'A',  accent: 'bg-indigo-500' },
-  '営業B': { short: 'B',  accent: 'bg-teal-500' },
-  '営業C': { short: 'C',  accent: 'bg-fuchsia-500' },
-  '未定':  { short: '?',  accent: 'bg-slate-400' },
-};
+// 担当者アバターの色。全体=violet / 未定=slate / メンバーはパレットを順番に割当
+const SPECIAL_ACCENT = { '全体': 'bg-violet-500', '未定': 'bg-slate-400' };
+const MEMBER_PALETTE = [
+  'bg-indigo-500', 'bg-teal-500', 'bg-fuchsia-500', 'bg-sky-500',
+  'bg-rose-500', 'bg-emerald-500', 'bg-orange-500', 'bg-cyan-500',
+];
 
 const STATUSES = ['未着手', '進行中', '完了'];
 const STATUS_STYLE = {
@@ -47,7 +46,6 @@ const PRIORITY_STYLE = {
 };
 const PRIORITY_ORDER = { '高': 0, '中': 1, '低': 2 };
 
-// 初回ログイン時に投入するサンプルデータ（id は Firestore が自動採番）
 const SEED_TASKS = [
   { name: '新規見込み顧客リストの作成',        assignee: '営業A', due: '2026-06-18', status: '進行中', priority: '高' },
   { name: 'A社 提案書の最終チェック',          assignee: '営業A', due: '2026-06-17', status: '未着手', priority: '高' },
@@ -69,15 +67,41 @@ const SEED_TASKS = [
   { name: 'クレーム対応（Y社）の一次受付',    assignee: '未定', due: '2026-06-16', status: '進行中', priority: '高' },
 ];
 
+/* ===================== ヘルパー ===================== */
+// メンバー配列から「担当者名 → 色クラス」のマップを生成
+function buildAccentMap(members) {
+  const map = { ...SPECIAL_ACCENT };
+  members.forEach((name, i) => { map[name] = MEMBER_PALETTE[i % MEMBER_PALETTE.length]; });
+  return map;
+}
+// アバターに表示する1文字（営業A→A / 田中→中 / 全体→全 / 未定→?）
+function avatarShort(name) {
+  if (!name) return '?';
+  if (name === '全体') return '全';
+  if (name === '未定') return '?';
+  const chars = Array.from(name);
+  return chars[chars.length - 1];
+}
+function isOverdue(due, status) {
+  if (status === '完了') return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return new Date(due) < today;
+}
+function fmtDate(d) {
+  const dt = new Date(d);
+  return (dt.getMonth() + 1) + '/' + dt.getDate();
+}
+
 /* ===================== 小物 ===================== */
-function Avatar({ name, size = 24, text = 'text-xs' }) {
-  const meta = ASSIGNEE_META[name] || { short: '?', accent: 'bg-slate-400' };
+function Avatar({ name, accentMap, size = 24, text = 'text-xs' }) {
+  const accent = (accentMap && accentMap[name]) || 'bg-slate-400';
   return (
     <span
-      className={'rounded-full text-white flex items-center justify-center font-semibold shrink-0 ' + meta.accent + ' ' + text}
+      className={'rounded-full text-white flex items-center justify-center font-semibold shrink-0 ' + accent + ' ' + text}
       style={{ width: size, height: size }}
     >
-      {meta.short}
+      {avatarShort(name)}
     </span>
   );
 }
@@ -118,19 +142,81 @@ function ProgressBar({ done, total, color = 'from-emerald-400 to-emerald-500' })
   );
 }
 
-function isOverdue(due, status) {
-  if (status === '完了') return false;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return new Date(due) < today;
+function Modal({ open, onClose, title, icon, children }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-slate-900/40" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-xl w-full max-w-md max-h-[90vh] overflow-auto">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100 sticky top-0 bg-white">
+          <h3 className="font-semibold text-slate-800 flex items-center gap-2">{icon}{title}</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 p-1 rounded"><X size={18} /></button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  );
 }
-function fmtDate(d) {
-  const dt = new Date(d);
-  return (dt.getMonth() + 1) + '/' + dt.getDate();
+
+/* ===================== 行動指針バナー（最上部） ===================== */
+function GuidelineBanner({ text, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(text || '');
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { setDraft(text || ''); }, [text]);
+
+  const save = async () => {
+    setSaving(true);
+    try { await onSave(draft); setEditing(false); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <div className="bg-gradient-to-r from-indigo-600 to-violet-600 text-white">
+      <div className="max-w-6xl mx-auto px-6 py-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2 text-indigo-100 text-sm font-semibold">
+            <Target size={18} />
+            次の2週間の行動指針
+          </div>
+          {!editing && (
+            <button onClick={() => setEditing(true)}
+              className="inline-flex items-center gap-1.5 text-xs bg-white/15 hover:bg-white/25 px-2.5 py-1 rounded-md transition-colors">
+              <Pencil size={13} /> 編集
+            </button>
+          )}
+        </div>
+
+        {editing ? (
+          <div className="mt-3">
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              rows={3}
+              placeholder="例：今期は既存顧客の深耕を最優先。各自、上位3社へ訪問アポを今週中に設定する。"
+              className="w-full rounded-lg px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-white/70"
+            />
+            <div className="mt-2 flex justify-end gap-2">
+              <button onClick={() => { setDraft(text || ''); setEditing(false); }}
+                className="text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/20">キャンセル</button>
+              <button onClick={save} disabled={saving}
+                className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-white text-indigo-700 font-medium hover:bg-indigo-50 disabled:opacity-60">
+                <Save size={13} /> 保存
+              </button>
+            </div>
+          </div>
+        ) : (
+          <p className="mt-1.5 text-base sm:text-lg font-medium leading-relaxed whitespace-pre-wrap">
+            {text ? text : <span className="text-indigo-200 text-sm font-normal">まだ設定されていません。「編集」から今期の方針を入力してください。</span>}
+          </p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 /* ===================== タスク行・テーブル ===================== */
-function TaskRow({ task, onStatusChange, onAssigneeChange, onDelete, showAssignee }) {
+function TaskRow({ task, assignees, accentMap, onStatusChange, onAssigneeChange, onEdit, onDelete, showAssignee }) {
   const overdue = isOverdue(task.due, task.status);
   return (
     <tr className="border-b border-slate-100 hover:bg-slate-50/70 transition-colors">
@@ -138,14 +224,14 @@ function TaskRow({ task, onStatusChange, onAssigneeChange, onDelete, showAssigne
       {showAssignee && (
         <td className="py-3 px-4">
           <div className="flex items-center gap-2">
-            <Avatar name={task.assignee} />
+            <Avatar name={task.assignee} accentMap={accentMap} />
             <select
               value={task.assignee}
               onChange={(e) => onAssigneeChange(task.id, e.target.value)}
               className="text-xs border border-slate-200 rounded-md px-1.5 py-1 bg-white text-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-300 cursor-pointer"
               title="担当者を変更"
             >
-              {ASSIGNEES.map((a) => <option key={a} value={a}>{a}</option>)}
+              {assignees.map((a) => <option key={a} value={a}>{a}</option>)}
             </select>
           </div>
         </td>
@@ -170,8 +256,11 @@ function TaskRow({ task, onStatusChange, onAssigneeChange, onDelete, showAssigne
           </select>
         </div>
       </td>
-      <td className="py-3 px-4 text-right">
-        <button onClick={() => onDelete(task.id)} className="text-slate-300 hover:text-rose-500 transition-colors p-1 rounded" title="削除">
+      <td className="py-3 px-4 text-right whitespace-nowrap">
+        <button onClick={() => onEdit(task)} className="text-slate-300 hover:text-indigo-500 transition-colors p-1 rounded" title="編集">
+          <Pencil size={16} />
+        </button>
+        <button onClick={() => onDelete(task.id)} className="text-slate-300 hover:text-rose-500 transition-colors p-1 rounded ml-1" title="削除">
           <Trash2 size={16} />
         </button>
       </td>
@@ -179,7 +268,8 @@ function TaskRow({ task, onStatusChange, onAssigneeChange, onDelete, showAssigne
   );
 }
 
-function TaskTable({ tasks, onStatusChange, onAssigneeChange, onDelete, showAssignee, emptyText = 'タスクはありません' }) {
+function TaskTable(props) {
+  const { tasks, showAssignee, emptyText = 'タスクはありません' } = props;
   if (tasks.length === 0) {
     return (
       <div className="text-center py-16 text-slate-400">
@@ -203,7 +293,17 @@ function TaskTable({ tasks, onStatusChange, onAssigneeChange, onDelete, showAssi
         </thead>
         <tbody>
           {tasks.map((t) => (
-            <TaskRow key={t.id} task={t} onStatusChange={onStatusChange} onAssigneeChange={onAssigneeChange} onDelete={onDelete} showAssignee={showAssignee} />
+            <TaskRow
+              key={t.id}
+              task={t}
+              assignees={props.assignees}
+              accentMap={props.accentMap}
+              onStatusChange={props.onStatusChange}
+              onAssigneeChange={props.onAssigneeChange}
+              onEdit={props.onEdit}
+              onDelete={props.onDelete}
+              showAssignee={showAssignee}
+            />
           ))}
         </tbody>
       </table>
@@ -267,6 +367,123 @@ function AddTaskForm({ fixedAssignee, onAdd, title, accentBtn = 'bg-indigo-600 h
   );
 }
 
+/* ===================== タスク編集モーダル ===================== */
+function TaskEditModal({ task, assignees, onSave, onClose }) {
+  const [name, setName] = useState(task.name);
+  const [assignee, setAssignee] = useState(task.assignee);
+  const [due, setDue] = useState(task.due);
+  const [priority, setPriority] = useState(task.priority);
+  const [status, setStatus] = useState(task.status);
+  const [saving, setSaving] = useState(false);
+
+  const save = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setSaving(true);
+    try {
+      await onSave(task.id, { name: name.trim(), assignee, due, priority, status });
+      onClose();
+    } finally { setSaving(false); }
+  };
+
+  const field = 'w-full border border-slate-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300';
+
+  return (
+    <Modal open onClose={onClose} title="タスクを編集" icon={<Pencil size={16} className="text-indigo-500" />}>
+      <form onSubmit={save} className="space-y-4">
+        <div>
+          <label className="block text-xs text-slate-400 mb-1">タスク名</label>
+          <input type="text" value={name} onChange={(e) => setName(e.target.value)} className={field} />
+        </div>
+        <div>
+          <label className="block text-xs text-slate-400 mb-1">担当者</label>
+          <select value={assignee} onChange={(e) => setAssignee(e.target.value)} className={field}>
+            {assignees.map((a) => <option key={a} value={a}>{a}</option>)}
+          </select>
+          <p className="text-[11px] text-slate-400 mt-1">担当者を変えて保存すると、その担当者のタブへ移動します。</p>
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">期限</label>
+            <input type="date" value={due} onChange={(e) => setDue(e.target.value)} className={field} />
+          </div>
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">優先度</label>
+            <select value={priority} onChange={(e) => setPriority(e.target.value)} className={field}>
+              {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">状態</label>
+            <select value={status} onChange={(e) => setStatus(e.target.value)} className={field}>
+              {STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <button type="button" onClick={onClose} className="text-sm px-4 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50">キャンセル</button>
+          <button type="submit" disabled={saving} className="inline-flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-medium disabled:opacity-60">
+            <Save size={15} /> 保存する
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/* ===================== メンバー管理モーダル ===================== */
+function MemberManagerModal({ members, accentMap, onAdd, onRename, onDelete, onClose }) {
+  const [newName, setNewName] = useState('');
+  const add = async (e) => {
+    e.preventDefault();
+    if (!newName.trim()) return;
+    await onAdd(newName.trim());
+    setNewName('');
+  };
+  return (
+    <Modal open onClose={onClose} title="メンバー管理" icon={<UserCog size={16} className="text-indigo-500" />}>
+      <div className="space-y-2">
+        {members.map((m) => (
+          <MemberRow key={m} name={m} accentMap={accentMap} onRename={onRename} onDelete={onDelete} />
+        ))}
+        {members.length === 0 && <p className="text-sm text-slate-400 py-4 text-center">メンバーがいません。下から追加してください。</p>}
+      </div>
+
+      <form onSubmit={add} className="mt-5 pt-4 border-t border-slate-100">
+        <label className="block text-xs text-slate-400 mb-1">新しいメンバーを追加</label>
+        <div className="flex gap-2">
+          <input type="text" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="例：営業D / 田中"
+            className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300" />
+          <button type="submit" className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-3 py-2 rounded-lg">
+            <Plus size={15} /> 追加
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function MemberRow({ name, accentMap, onRename, onDelete }) {
+  const [draft, setDraft] = useState(name);
+  useEffect(() => { setDraft(name); }, [name]);
+  const commit = () => { if (draft.trim() && draft.trim() !== name) onRename(name, draft.trim()); };
+  return (
+    <div className="flex items-center gap-2">
+      <Avatar name={name} accentMap={accentMap} size={28} />
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }}
+        className="flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+      />
+      <button onClick={() => onDelete(name)} className="text-slate-300 hover:text-rose-500 p-1.5 rounded" title="削除">
+        <Trash2 size={16} />
+      </button>
+    </div>
+  );
+}
+
 /* ===================== サマリー・進捗・サブタブ ===================== */
 function SummaryCards({ tasks }) {
   const total = tasks.length;
@@ -297,8 +514,8 @@ function SummaryCards({ tasks }) {
   );
 }
 
-function MemberProgress({ tasks }) {
-  const groups = [...MEMBERS, '全体', '未定'];
+function MemberProgress({ tasks, members, accentMap }) {
+  const groups = [...members, '全体', '未定'];
   return (
     <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
       <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-4">
@@ -313,7 +530,7 @@ function MemberProgress({ tasks }) {
           return (
             <div key={g} className="border border-slate-100 rounded-lg p-4 bg-slate-50/50">
               <div className="flex items-center gap-2 mb-3">
-                <Avatar name={g} size={28} />
+                <Avatar name={g} accentMap={accentMap} size={28} />
                 <span className="font-medium text-slate-700 text-sm">{g}</span>
                 {g === '未定' && mt.length > 0 && (
                   <span className="ml-auto text-[11px] text-amber-600 bg-amber-50 ring-1 ring-amber-200 px-1.5 py-0.5 rounded">要割当 {mt.length}</span>
@@ -357,55 +574,104 @@ function SubTabs({ current, onChange, counts }) {
 export default function Dashboard() {
   const { user, logout } = useAuth();
   const [tasks, setTasks] = useState([]);
+  const [members, setMembers] = useState(DEFAULT_MEMBERS);
+  const [guideline, setGuideline] = useState('');
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('全体');
   const [overviewSub, setOverviewSub] = useState('all');
+  const [editingTask, setEditingTask] = useState(null);
+  const [showMembers, setShowMembers] = useState(false);
 
   const uid = user?.uid;
-  const tasksColRef = () => collection(db, 'users', uid, 'tasks');
+  const metaRef = () => doc(db, 'users', uid, 'meta', 'app');
 
-  // --- 取得（リアルタイム購読） ---
+  // --- タスク購読 ---
   useEffect(() => {
     if (!uid) return;
     const unsub = onSnapshot(
       collection(db, 'users', uid, 'tasks'),
-      (snap) => {
-        setTasks(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-        setLoading(false);
-      },
-      (err) => { console.error('[onSnapshot]', err); setLoading(false); }
+      (snap) => { setTasks(snap.docs.map((d) => ({ id: d.id, ...d.data() }))); setLoading(false); },
+      (err) => { console.error('[tasks onSnapshot]', err); setLoading(false); }
     );
     return unsub;
   }, [uid]);
 
-  // --- 初回ログイン時のサンプル投入（空のときだけ・一度だけ） ---
+  // --- 設定（メンバー・行動指針）購読 ---
+  useEffect(() => {
+    if (!uid) return;
+    const unsub = onSnapshot(doc(db, 'users', uid, 'meta', 'app'), (snap) => {
+      const d = snap.exists() ? snap.data() : {};
+      setMembers(Array.isArray(d.members) && d.members.length ? d.members : DEFAULT_MEMBERS);
+      setGuideline(typeof d.guideline === 'string' ? d.guideline : '');
+    });
+    return unsub;
+  }, [uid]);
+
+  // --- 初回サンプル投入（空のときだけ・一度だけ） ---
   useEffect(() => {
     if (!uid) return;
     const seedIfEmpty = async () => {
-      const metaRef = doc(db, 'users', uid, 'meta', 'app');
-      const metaSnap = await getDoc(metaRef);
-      if (metaSnap.exists() && metaSnap.data().seeded) return; // 投入済み
+      const ref = doc(db, 'users', uid, 'meta', 'app');
+      const metaSnap = await getDoc(ref);
+      if (metaSnap.exists() && metaSnap.data().seeded) return;
       const tasksSnap = await getDocs(collection(db, 'users', uid, 'tasks'));
       if (!tasksSnap.empty) {
-        await setDoc(metaRef, { seeded: true }, { merge: true });
+        await setDoc(ref, { seeded: true, members: DEFAULT_MEMBERS }, { merge: true });
         return;
       }
       const batch = writeBatch(db);
       SEED_TASKS.forEach((t) => {
-        const ref = doc(collection(db, 'users', uid, 'tasks'));
-        batch.set(ref, { ...t, createdAt: serverTimestamp() });
+        const tref = doc(collection(db, 'users', uid, 'tasks'));
+        batch.set(tref, { ...t, createdAt: serverTimestamp() });
       });
-      batch.set(metaRef, { seeded: true }, { merge: true });
+      batch.set(ref, { seeded: true, members: DEFAULT_MEMBERS, guideline: '' }, { merge: true });
       await batch.commit();
     };
     seedIfEmpty().catch((e) => console.error('[seed]', e));
   }, [uid]);
 
-  // --- CRUD ---
-  const addTask = (t) => addDoc(tasksColRef(), { ...t, createdAt: serverTimestamp() });
+  // --- アクティブタブの整合性（メンバー削除/改名時） ---
+  useEffect(() => {
+    if (activeTab !== '全体' && !members.includes(activeTab)) setActiveTab('全体');
+  }, [members, activeTab]);
+
+  const accentMap = useMemo(() => buildAccentMap(members), [members]);
+  const assignees = useMemo(() => ['全体', ...members, '未定'], [members]);
+
+  // --- タスク CRUD ---
+  const addTask = (t) => addDoc(collection(db, 'users', uid, 'tasks'), { ...t, createdAt: serverTimestamp() });
   const changeStatus = (id, status) => updateDoc(doc(db, 'users', uid, 'tasks', id), { status });
   const changeAssignee = (id, assignee) => updateDoc(doc(db, 'users', uid, 'tasks', id), { assignee });
+  const updateTask = (id, patch) => updateDoc(doc(db, 'users', uid, 'tasks', id), patch);
   const deleteTask = (id) => deleteDoc(doc(db, 'users', uid, 'tasks', id));
+
+  // --- 行動指針 ---
+  const saveGuideline = (text) => setDoc(metaRef(), { guideline: text, guidelineUpdatedAt: serverTimestamp() }, { merge: true });
+
+  // --- メンバー管理 ---
+  const addMember = async (name) => {
+    if (members.includes(name) || SPECIAL.includes(name)) { alert('同じ名前、または予約語（全体／未定）は使えません。'); return; }
+    await setDoc(metaRef(), { members: [...members, name] }, { merge: true });
+  };
+  const renameMember = async (oldName, newName) => {
+    if (members.includes(newName) || SPECIAL.includes(newName)) { alert('同じ名前、または予約語（全体／未定）は使えません。'); return; }
+    const newMembers = members.map((m) => (m === oldName ? newName : m));
+    const batch = writeBatch(db);
+    batch.set(metaRef(), { members: newMembers }, { merge: true });
+    tasks.filter((t) => t.assignee === oldName).forEach((t) => batch.update(doc(db, 'users', uid, 'tasks', t.id), { assignee: newName }));
+    await batch.commit();
+    if (activeTab === oldName) setActiveTab(newName);
+  };
+  const deleteMember = async (name) => {
+    const cnt = tasks.filter((t) => t.assignee === name).length;
+    if (!confirm(`「${name}」を削除します。${cnt > 0 ? `担当タスク${cnt}件は「未定」へ移動します。` : ''}よろしいですか？`)) return;
+    const newMembers = members.filter((m) => m !== name);
+    const batch = writeBatch(db);
+    batch.set(metaRef(), { members: newMembers }, { merge: true });
+    tasks.filter((t) => t.assignee === name).forEach((t) => batch.update(doc(db, 'users', uid, 'tasks', t.id), { assignee: '未定' }));
+    await batch.commit();
+    if (activeTab === name) setActiveTab('全体');
+  };
 
   const sortTasks = (arr) => [...arr].sort((a, b) => {
     if ((a.status === '完了') !== (b.status === '完了')) return a.status === '完了' ? 1 : -1;
@@ -431,14 +697,20 @@ export default function Dashboard() {
     return sortTasks(filtered);
   }, [tasks, activeTab, overviewSub]);
 
-  const tabs = ['全体', ...MEMBERS];
-  const todayLabel = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`;
-  })();
+  const tabs = ['全体', ...members];
+  const todayLabel = (() => { const d = new Date(); return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`; })();
+
+  const tableProps = {
+    assignees, accentMap,
+    onStatusChange: changeStatus, onAssigneeChange: changeAssignee,
+    onEdit: setEditingTask, onDelete: deleteTask,
+  };
 
   return (
     <div className="min-h-screen bg-slate-100">
+      {/* 行動指針（最上部・最も目立つ位置） */}
+      <GuidelineBanner text={guideline} onSave={saveGuideline} />
+
       {/* ヘッダー */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-10">
         <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
@@ -451,11 +723,16 @@ export default function Dashboard() {
               <p className="text-xs text-slate-400 mt-1">{user?.email}</p>
             </div>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
             <div className="hidden sm:flex items-center gap-2 text-sm text-slate-500">
               <CalendarDays size={16} />
               <span>{todayLabel}</span>
             </div>
+            <button onClick={() => setShowMembers(true)}
+              className="inline-flex items-center gap-2 text-sm text-slate-600 hover:text-indigo-600 border border-slate-200 hover:border-indigo-200 px-3 py-2 rounded-lg transition-colors">
+              <UserCog size={16} />
+              <span className="hidden sm:inline">メンバー管理</span>
+            </button>
             <button onClick={() => { if (confirm('ログアウトしますか？')) logout(); }}
               className="inline-flex items-center gap-2 text-sm text-slate-500 hover:text-rose-500 border border-slate-200 hover:border-rose-200 px-3 py-2 rounded-lg transition-colors">
               <LogOut size={16} />
@@ -464,16 +741,16 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* タブ */}
+        {/* タブ（メンバーと連動） */}
         <div className="max-w-6xl mx-auto px-6">
-          <nav className="flex gap-1 -mb-px">
+          <nav className="flex gap-1 -mb-px overflow-x-auto">
             {tabs.map((tab) => {
               const active = activeTab === tab;
               return (
                 <button key={tab} onClick={() => setActiveTab(tab)}
-                  className={'px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ' + (active ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300')}>
+                  className={'px-4 py-2.5 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ' + (active ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300')}>
                   <span className="inline-flex items-center gap-1.5">
-                    {tab === '全体' ? <Layers size={15} /> : <Avatar name={tab} size={17} text="text-[9px]" />}
+                    {tab === '全体' ? <Layers size={15} /> : <Avatar name={tab} accentMap={accentMap} size={17} text="text-[9px]" />}
                     {tab}
                   </span>
                 </button>
@@ -493,7 +770,7 @@ export default function Dashboard() {
         ) : activeTab === '全体' ? (
           <>
             <SummaryCards tasks={tasks} />
-            <MemberProgress tasks={tasks} />
+            <MemberProgress tasks={tasks} members={members} accentMap={accentMap} />
             <SubTabs current={overviewSub} onChange={setOverviewSub} counts={counts} />
 
             {overviewSub === 'all' && (
@@ -503,7 +780,7 @@ export default function Dashboard() {
                   <h3 className="text-sm font-semibold text-slate-700">全員のタスク一覧（すべて）</h3>
                   <span className="ml-auto text-xs text-slate-400">{visibleTasks.length}件</span>
                 </div>
-                <TaskTable tasks={visibleTasks} onStatusChange={changeStatus} onAssigneeChange={changeAssignee} onDelete={deleteTask} showAssignee />
+                <TaskTable tasks={visibleTasks} showAssignee {...tableProps} />
               </div>
             )}
 
@@ -520,7 +797,7 @@ export default function Dashboard() {
                     <h3 className="text-sm font-semibold text-slate-700">全体タスク一覧</h3>
                     <span className="ml-auto text-xs text-slate-400">{visibleTasks.length}件</span>
                   </div>
-                  <TaskTable tasks={visibleTasks} onStatusChange={changeStatus} onAssigneeChange={changeAssignee} onDelete={deleteTask} showAssignee emptyText="全体タスクはまだありません" />
+                  <TaskTable tasks={visibleTasks} showAssignee {...tableProps} emptyText="全体タスクはまだありません" />
                 </div>
               </>
             )}
@@ -529,7 +806,7 @@ export default function Dashboard() {
               <>
                 <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
                   <HelpCircle size={20} className="text-amber-600 mt-0.5" />
-                  <p className="text-sm text-amber-800">担当者が決まっていないタスクです。一覧の<span className="font-semibold">「担当者」欄</span>から営業A・B・Cへ割り当てられます。</p>
+                  <p className="text-sm text-amber-800">担当者が決まっていないタスクです。一覧の<span className="font-semibold">「担当者」欄</span>から各メンバーへ割り当てられます。</p>
                 </div>
                 <AddTaskForm fixedAssignee="未定" onAdd={addTask} title="「未定」タスクを追加" accentBtn="bg-amber-500 hover:bg-amber-600" />
                 <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
@@ -538,7 +815,7 @@ export default function Dashboard() {
                     <h3 className="text-sm font-semibold text-slate-700">未定タスク一覧（要割当）</h3>
                     <span className="ml-auto text-xs text-slate-400">{visibleTasks.length}件</span>
                   </div>
-                  <TaskTable tasks={visibleTasks} onStatusChange={changeStatus} onAssigneeChange={changeAssignee} onDelete={deleteTask} showAssignee emptyText="未定のタスクはありません 🎉" />
+                  <TaskTable tasks={visibleTasks} showAssignee {...tableProps} emptyText="未定のタスクはありません 🎉" />
                 </div>
               </>
             )}
@@ -547,7 +824,7 @@ export default function Dashboard() {
           <>
             <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
               <div className="flex items-center gap-3 mb-4">
-                <Avatar name={activeTab} size={40} text="text-sm" />
+                <Avatar name={activeTab} accentMap={accentMap} size={40} text="text-sm" />
                 <div>
                   <h2 className="font-bold text-slate-800">{activeTab} さんのタスク</h2>
                   <p className="text-xs text-slate-400">担当タスクの進捗</p>
@@ -567,7 +844,7 @@ export default function Dashboard() {
                 <h3 className="text-sm font-semibold text-slate-700">{activeTab} のタスク一覧</h3>
                 <span className="ml-auto text-xs text-slate-400">{visibleTasks.length}件</span>
               </div>
-              <TaskTable tasks={visibleTasks} onStatusChange={changeStatus} onAssigneeChange={changeAssignee} onDelete={deleteTask} showAssignee={false} />
+              <TaskTable tasks={visibleTasks} showAssignee={false} {...tableProps} />
             </div>
           </>
         )}
@@ -576,6 +853,18 @@ export default function Dashboard() {
           チームタスク管理ダッシュボード — Firebase 連携版
         </footer>
       </main>
+
+      {/* モーダル */}
+      {editingTask && (
+        <TaskEditModal task={editingTask} assignees={assignees} onSave={updateTask} onClose={() => setEditingTask(null)} />
+      )}
+      {showMembers && (
+        <MemberManagerModal
+          members={members} accentMap={accentMap}
+          onAdd={addMember} onRename={renameMember} onDelete={deleteMember}
+          onClose={() => setShowMembers(false)}
+        />
+      )}
     </div>
   );
 }
