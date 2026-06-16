@@ -1,0 +1,34 @@
+rules_version = '2';
+
+// ============================================================
+// ステップ4: Firestore セキュリティルール（hoisapo-pj 用）
+// ------------------------------------------------------------
+// 方針:
+//   ・ログイン（認証済み）していないユーザーは一切読み書き不可
+//   ・各ユーザーは「自分の uid 配下」のデータだけ読み書き可能
+//   ・users/{uid}/** という形なので、
+//       - team-dashboard の users/{uid}/tasks
+//       - nursery-guidance-app の users/{uid}/nurseries
+//     どちらも同じ「本人のみ許可」で安全にカバーされます（他アプリも壊しません）。
+//
+// ⚠️ 重要:
+//   このルールはプロジェクト全体に適用されます。既存の nursery-guidance-app と
+//   同じ Firebase プロジェクト(hoisapo-pj)を共有しているため、適用前に必ず
+//   「現在のルール」を確認してください（手順は README / 回答を参照）。
+//   既に users/{uid} を本人のみに許可するルールが入っている場合は、変更不要です。
+// ============================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 自分の領域（users/{uid} 配下すべて）は本人のみ読み書き可
+    match /users/{userId}/{document=**} {
+      allow read, write: if request.auth != null
+                         && request.auth.uid == userId;
+    }
+
+    // 上記以外のパスはすべて拒否（デフォルトで拒否されるが、明示しておく）
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

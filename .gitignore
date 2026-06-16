@@ -1,0 +1,13 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# 環境変数（APIキー等）はコミットしない
+.env
+.env.*.local
+
+# エディタ
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
