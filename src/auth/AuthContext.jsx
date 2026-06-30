@@ -1,46 +1,58 @@
 // ============================================================
-// ステップ2-a: 認証コンテキスト
+// 認証コンテキスト（Google + メール/パスワード）
 // ------------------------------------------------------------
-// ・現在のログインユーザー(user)とローディング状態(loading)を全画面に供給
-// ・login / signup / logout のヘルパーを提供
-// ・onAuthStateChanged でログイン状態の変化を購読
+// ・連携仕様に合わせ Google ログインを主とする（uid/email がほいさぽと一致）
+// ・許可ドメイン(@ito-kyozaisha.co.jp / @codmono.com)以外は自動ログアウト
+// ・当面の保険としてメール/パスワードも残す（Googleが未設定でも動くように）
 // ============================================================
 import { createContext, useContext, useEffect, useState } from 'react';
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
+  signInWithPopup,
+  GoogleAuthProvider,
   signOut,
 } from 'firebase/auth';
 import { auth } from '../firebase';
+import { isAllowedEmail, ALLOWED_EMAIL_DOMAINS } from '../integration/contract';
 
 const AuthContext = createContext(null);
-
-// 各コンポーネントから useAuth() で認証情報を取得できる
 export const useAuth = () => useContext(AuthContext);
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true); // 初回の認証状態確認中
+  const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState('');
 
   useEffect(() => {
-    // ログイン状態を監視。ページ再読込時もここで自動復帰する。
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      // ドメイン制限：許可外のアカウントはログインさせない
+      if (currentUser && !isAllowedEmail(currentUser.email)) {
+        await signOut(auth);
+        setUser(null);
+        setAuthError(
+          `このアカウント(${currentUser.email})は許可されていません。` +
+            `${ALLOWED_EMAIL_DOMAINS.map((d) => '@' + d).join(' / ')} のみ利用できます。`
+        );
+        setLoading(false);
+        return;
+      }
       setUser(currentUser);
       setLoading(false);
     });
-    return unsubscribe; // アンマウント時に購読解除
+    return unsubscribe;
   }, []);
 
-  const login = (email, password) =>
-    signInWithEmailAndPassword(auth, email, password);
+  const provider = new GoogleAuthProvider();
+  // 同一ドメインのアカウント選択を促す（任意のヒント）
+  provider.setCustomParameters({ prompt: 'select_account' });
 
-  const signup = (email, password) =>
-    createUserWithEmailAndPassword(auth, email, password);
-
+  const loginWithGoogle = () => { setAuthError(''); return signInWithPopup(auth, provider); };
+  const login = (email, password) => { setAuthError(''); return signInWithEmailAndPassword(auth, email, password); };
+  const signup = (email, password) => { setAuthError(''); return createUserWithEmailAndPassword(auth, email, password); };
   const logout = () => signOut(auth);
 
-  const value = { user, loading, login, signup, logout };
-
+  const value = { user, loading, authError, setAuthError, loginWithGoogle, login, signup, logout };
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

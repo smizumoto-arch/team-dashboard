@@ -1,12 +1,16 @@
 // ============================================================
-// ダッシュボード本体（メンバー動的管理 + タスク編集 + 行動指針）
+// ダッシュボード本体
+//   ・メンバー動的管理（表示名 + 連携キーemail）
+//   ・タスク編集モーダル / 担当者変更で自動移動
+//   ・2週間の行動指針バナー
+//   ・連携対応：?from=hoisapo で本人タブを自動表示 / #/tasks/:id ディープリンク
 // ------------------------------------------------------------
-// Firestore データ構造:
+// Firestore:
 //   users/{uid}/tasks/{taskId}  { name, assignee, due, status, priority, createdAt }
-//   users/{uid}/meta/app        { seeded, members: string[], guideline: string }
-// すべて onSnapshot でリアルタイム購読。将来のDB連携をそのまま見据えた構造。
+//   users/{uid}/meta/app        { seeded, members:string[], memberEmails:{name:email}, guideline }
 // ============================================================
 import { useEffect, useMemo, useState } from 'react';
+import { useParams } from 'react-router-dom';
 import {
   collection, addDoc, updateDoc, deleteDoc, doc,
   onSnapshot, getDocs, getDoc, setDoc, writeBatch, serverTimestamp,
@@ -15,16 +19,18 @@ import {
   LayoutDashboard, Layers, List, Plus, PlusCircle, Calendar, CalendarDays,
   Trash2, AlertCircle, AlertTriangle, CheckCircle2, Loader, ListTodo, Users,
   Building2, HelpCircle, ChevronsUp, ChevronUp, ChevronDown, Inbox, LogOut,
-  Pencil, X, UserCog, Save, Target,
+  Pencil, X, UserCog, Save, Target, Mail,
 } from 'lucide-react';
 import { db } from '../firebase';
 import { useAuth } from '../auth/AuthContext';
+import { TEAM_ROSTER, normalizeEmail } from '../integration/contract';
 
 /* ===================== 定数・マスタ ===================== */
-const DEFAULT_MEMBERS = ['営業A', '営業B', '営業C'];
-const SPECIAL = ['全体', '未定']; // メンバーではない特別な担当区分
+// 連携仕様の5名を初期メンバーに（表示名 + 連携キーemail）
+const DEFAULT_MEMBERS = TEAM_ROSTER.map((r) => r.name);
+const DEFAULT_MEMBER_EMAILS = Object.fromEntries(TEAM_ROSTER.map((r) => [r.name, r.email]));
+const SPECIAL = ['全体', '未定'];
 
-// 担当者アバターの色。全体=violet / 未定=slate / メンバーはパレットを順番に割当
 const SPECIAL_ACCENT = { '全体': 'bg-violet-500', '未定': 'bg-slate-400' };
 const MEMBER_PALETTE = [
   'bg-indigo-500', 'bg-teal-500', 'bg-fuchsia-500', 'bg-sky-500',
@@ -47,18 +53,18 @@ const PRIORITY_STYLE = {
 const PRIORITY_ORDER = { '高': 0, '中': 1, '低': 2 };
 
 const SEED_TASKS = [
-  { name: '新規見込み顧客リストの作成',        assignee: '営業A', due: '2026-06-18', status: '進行中', priority: '高' },
-  { name: 'A社 提案書の最終チェック',          assignee: '営業A', due: '2026-06-17', status: '未着手', priority: '高' },
-  { name: '週次レポート提出',                  assignee: '営業A', due: '2026-06-19', status: '未着手', priority: '中' },
-  { name: 'B社 契約更新の打ち合わせ',          assignee: '営業A', due: '2026-06-15', status: '完了',   priority: '中' },
-  { name: '展示会フォローアップメール送信',    assignee: '営業B', due: '2026-06-16', status: '進行中', priority: '高' },
-  { name: 'C社 見積もり再作成',                assignee: '営業B', due: '2026-06-20', status: '未着手', priority: '中' },
-  { name: 'CRMデータ更新',                     assignee: '営業B', due: '2026-06-22', status: '未着手', priority: '低' },
-  { name: '月次目標の振り返り資料',            assignee: '営業B', due: '2026-06-14', status: '完了',   priority: '中' },
-  { name: 'D社 デモ準備',                      assignee: '営業C', due: '2026-06-18', status: '進行中', priority: '高' },
-  { name: '問い合わせ一次対応',                assignee: '営業C', due: '2026-06-16', status: '進行中', priority: '中' },
-  { name: '競合製品の調査メモ',                assignee: '営業C', due: '2026-06-25', status: '未着手', priority: '低' },
-  { name: '請求書発行依頼',                    assignee: '営業C', due: '2026-06-13', status: '完了',   priority: '低' },
+  { name: '新規見込み顧客リストの作成',        assignee: '伊東 靖記', due: '2026-06-18', status: '進行中', priority: '高' },
+  { name: 'A社 提案書の最終チェック',          assignee: '伊東 靖記', due: '2026-06-17', status: '未着手', priority: '高' },
+  { name: '週次レポート提出',                  assignee: '伊東 靖記', due: '2026-06-19', status: '未着手', priority: '中' },
+  { name: 'B社 契約更新の打ち合わせ',          assignee: '杉本 鉄馬', due: '2026-06-15', status: '完了',   priority: '中' },
+  { name: '展示会フォローアップメール送信',    assignee: '杉本 鉄馬', due: '2026-06-16', status: '進行中', priority: '高' },
+  { name: 'C社 見積もり再作成',                assignee: '杉本 鉄馬', due: '2026-06-20', status: '未着手', priority: '中' },
+  { name: 'CRMデータ更新',                     assignee: '水元 駿生', due: '2026-06-22', status: '未着手', priority: '低' },
+  { name: '月次目標の振り返り資料',            assignee: '水元 駿生', due: '2026-06-14', status: '完了',   priority: '中' },
+  { name: 'D社 デモ準備',                      assignee: '水元 駿生', due: '2026-06-18', status: '進行中', priority: '高' },
+  { name: '問い合わせ一次対応',                assignee: '内藤 晋一', due: '2026-06-16', status: '進行中', priority: '中' },
+  { name: '競合製品の調査メモ',                assignee: '内藤 晋一', due: '2026-06-25', status: '未着手', priority: '低' },
+  { name: '請求書発行依頼',                    assignee: '大橋 康史', due: '2026-06-13', status: '完了',   priority: '低' },
   { name: '事業部 月次キックオフMTGの準備',   assignee: '全体', due: '2026-06-19', status: '進行中', priority: '高' },
   { name: '下半期 部門予算の見直し資料作成',  assignee: '全体', due: '2026-06-24', status: '未着手', priority: '中' },
   { name: '営業ナレッジ共有ドキュメント整備', assignee: '全体', due: '2026-06-30', status: '未着手', priority: '低' },
@@ -68,18 +74,16 @@ const SEED_TASKS = [
 ];
 
 /* ===================== ヘルパー ===================== */
-// メンバー配列から「担当者名 → 色クラス」のマップを生成
 function buildAccentMap(members) {
   const map = { ...SPECIAL_ACCENT };
   members.forEach((name, i) => { map[name] = MEMBER_PALETTE[i % MEMBER_PALETTE.length]; });
   return map;
 }
-// アバターに表示する1文字（営業A→A / 田中→中 / 全体→全 / 未定→?）
 function avatarShort(name) {
   if (!name) return '?';
   if (name === '全体') return '全';
   if (name === '未定') return '?';
-  const chars = Array.from(name);
+  const chars = Array.from(name.replace(/\s/g, ''));
   return chars[chars.length - 1];
 }
 function isOverdue(due, status) {
@@ -97,10 +101,8 @@ function fmtDate(d) {
 function Avatar({ name, accentMap, size = 24, text = 'text-xs' }) {
   const accent = (accentMap && accentMap[name]) || 'bg-slate-400';
   return (
-    <span
-      className={'rounded-full text-white flex items-center justify-center font-semibold shrink-0 ' + accent + ' ' + text}
-      style={{ width: size, height: size }}
-    >
+    <span className={'rounded-full text-white flex items-center justify-center font-semibold shrink-0 ' + accent + ' ' + text}
+      style={{ width: size, height: size }}>
       {avatarShort(name)}
     </span>
   );
@@ -121,8 +123,7 @@ function PriorityBadge({ priority }) {
   const I = p.Icon;
   return (
     <span className={'inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-semibold ' + p.badge}>
-      <I size={13} />
-      {priority}
+      <I size={13} />{priority}
     </span>
   );
 }
@@ -167,8 +168,7 @@ function GuidelineBanner({ text, onSave }) {
 
   const save = async () => {
     setSaving(true);
-    try { await onSave(draft); setEditing(false); }
-    finally { setSaving(false); }
+    try { await onSave(draft); setEditing(false); } finally { setSaving(false); }
   };
 
   return (
@@ -176,8 +176,7 @@ function GuidelineBanner({ text, onSave }) {
       <div className="max-w-6xl mx-auto px-6 py-4">
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-2 text-indigo-100 text-sm font-semibold">
-            <Target size={18} />
-            次の2週間の行動指針
+            <Target size={18} /> 次の2週間の行動指針
           </div>
           {!editing && (
             <button onClick={() => setEditing(true)}
@@ -186,16 +185,11 @@ function GuidelineBanner({ text, onSave }) {
             </button>
           )}
         </div>
-
         {editing ? (
           <div className="mt-3">
-            <textarea
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              rows={3}
+            <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={3}
               placeholder="例：今期は既存顧客の深耕を最優先。各自、上位3社へ訪問アポを今週中に設定する。"
-              className="w-full rounded-lg px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-white/70"
-            />
+              className="w-full rounded-lg px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-white/70" />
             <div className="mt-2 flex justify-end gap-2">
               <button onClick={() => { setDraft(text || ''); setEditing(false); }}
                 className="text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/20">キャンセル</button>
@@ -225,12 +219,8 @@ function TaskRow({ task, assignees, accentMap, onStatusChange, onAssigneeChange,
         <td className="py-3 px-4">
           <div className="flex items-center gap-2">
             <Avatar name={task.assignee} accentMap={accentMap} />
-            <select
-              value={task.assignee}
-              onChange={(e) => onAssigneeChange(task.id, e.target.value)}
-              className="text-xs border border-slate-200 rounded-md px-1.5 py-1 bg-white text-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-300 cursor-pointer"
-              title="担当者を変更"
-            >
+            <select value={task.assignee} onChange={(e) => onAssigneeChange(task.id, e.target.value)} title="担当者を変更"
+              className="text-xs border border-slate-200 rounded-md px-1.5 py-1 bg-white text-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-300 cursor-pointer">
               {assignees.map((a) => <option key={a} value={a}>{a}</option>)}
             </select>
           </div>
@@ -238,8 +228,7 @@ function TaskRow({ task, assignees, accentMap, onStatusChange, onAssigneeChange,
       )}
       <td className="py-3 px-4 whitespace-nowrap">
         <span className={'inline-flex items-center gap-1.5 text-sm ' + (overdue ? 'text-rose-600 font-semibold' : 'text-slate-600')}>
-          <Calendar size={14} />
-          {fmtDate(task.due)}
+          <Calendar size={14} />{fmtDate(task.due)}
           {overdue && <AlertCircle size={14} className="text-rose-500" />}
         </span>
       </td>
@@ -247,22 +236,15 @@ function TaskRow({ task, assignees, accentMap, onStatusChange, onAssigneeChange,
       <td className="py-3 px-4">
         <div className="flex items-center gap-2">
           <StatusBadge status={task.status} />
-          <select
-            value={task.status}
-            onChange={(e) => onStatusChange(task.id, e.target.value)}
-            className="text-xs border border-slate-200 rounded-md px-1.5 py-1 bg-white text-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-300 cursor-pointer"
-          >
+          <select value={task.status} onChange={(e) => onStatusChange(task.id, e.target.value)}
+            className="text-xs border border-slate-200 rounded-md px-1.5 py-1 bg-white text-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-300 cursor-pointer">
             {STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
       </td>
       <td className="py-3 px-4 text-right whitespace-nowrap">
-        <button onClick={() => onEdit(task)} className="text-slate-300 hover:text-indigo-500 transition-colors p-1 rounded" title="編集">
-          <Pencil size={16} />
-        </button>
-        <button onClick={() => onDelete(task.id)} className="text-slate-300 hover:text-rose-500 transition-colors p-1 rounded ml-1" title="削除">
-          <Trash2 size={16} />
-        </button>
+        <button onClick={() => onEdit(task)} className="text-slate-300 hover:text-indigo-500 transition-colors p-1 rounded" title="編集"><Pencil size={16} /></button>
+        <button onClick={() => onDelete(task.id)} className="text-slate-300 hover:text-rose-500 transition-colors p-1 rounded ml-1" title="削除"><Trash2 size={16} /></button>
       </td>
     </tr>
   );
@@ -293,17 +275,9 @@ function TaskTable(props) {
         </thead>
         <tbody>
           {tasks.map((t) => (
-            <TaskRow
-              key={t.id}
-              task={t}
-              assignees={props.assignees}
-              accentMap={props.accentMap}
-              onStatusChange={props.onStatusChange}
-              onAssigneeChange={props.onAssigneeChange}
-              onEdit={props.onEdit}
-              onDelete={props.onDelete}
-              showAssignee={showAssignee}
-            />
+            <TaskRow key={t.id} task={t} assignees={props.assignees} accentMap={props.accentMap}
+              onStatusChange={props.onStatusChange} onAssigneeChange={props.onAssigneeChange}
+              onEdit={props.onEdit} onDelete={props.onDelete} showAssignee={showAssignee} />
           ))}
         </tbody>
       </table>
@@ -328,8 +302,7 @@ function AddTaskForm({ fixedAssignee, onAdd, title, accentBtn = 'bg-indigo-600 h
   return (
     <form onSubmit={submit} className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
       <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-4">
-        <PlusCircle size={18} className="text-indigo-500" />
-        {title}
+        <PlusCircle size={18} className="text-indigo-500" />{title}
       </h3>
       <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
         <div className="md:col-span-5">
@@ -359,8 +332,7 @@ function AddTaskForm({ fixedAssignee, onAdd, title, accentBtn = 'bg-indigo-600 h
       </div>
       <div className="mt-4 flex justify-end">
         <button type="submit" className={'inline-flex items-center gap-2 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors shadow-sm ' + accentBtn}>
-          <Plus size={16} />
-          追加する
+          <Plus size={16} />追加する
         </button>
       </div>
     </form>
@@ -380,12 +352,9 @@ function TaskEditModal({ task, assignees, onSave, onClose }) {
     e.preventDefault();
     if (!name.trim()) return;
     setSaving(true);
-    try {
-      await onSave(task.id, { name: name.trim(), assignee, due, priority, status });
-      onClose();
-    } finally { setSaving(false); }
+    try { await onSave(task.id, { name: name.trim(), assignee, due, priority, status }); onClose(); }
+    finally { setSaving(false); }
   };
-
   const field = 'w-full border border-slate-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300';
 
   return (
@@ -432,27 +401,58 @@ function TaskEditModal({ task, assignees, onSave, onClose }) {
 }
 
 /* ===================== メンバー管理モーダル ===================== */
-function MemberManagerModal({ members, accentMap, onAdd, onRename, onDelete, onClose }) {
+function MemberRow({ name, email, accentMap, onRename, onSetEmail, onDelete }) {
+  const [dName, setDName] = useState(name);
+  const [dEmail, setDEmail] = useState(email || '');
+  useEffect(() => { setDName(name); }, [name]);
+  useEffect(() => { setDEmail(email || ''); }, [email]);
+  const commitName = () => { const v = dName.trim(); if (v && v !== name) onRename(name, v); };
+  const commitEmail = () => { const v = dEmail.trim(); if (v !== (email || '')) onSetEmail(name, v); };
+  return (
+    <div className="border border-slate-100 rounded-lg p-3 space-y-2">
+      <div className="flex items-center gap-2">
+        <Avatar name={name} accentMap={accentMap} size={28} />
+        <input value={dName} onChange={(e) => setDName(e.target.value)} onBlur={commitName}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }}
+          className="flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300" />
+        <button onClick={() => onDelete(name)} className="text-slate-300 hover:text-rose-500 p-1.5 rounded" title="削除"><Trash2 size={16} /></button>
+      </div>
+      <div className="relative">
+        <Mail size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-300" />
+        <input value={dEmail} onChange={(e) => setDEmail(e.target.value)} onBlur={commitEmail}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }}
+          placeholder="連携キー：メールアドレス（任意）"
+          className="w-full border border-slate-200 rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-300" />
+      </div>
+    </div>
+  );
+}
+
+function MemberManagerModal({ members, memberEmails, accentMap, onAdd, onRename, onSetEmail, onDelete, onClose }) {
   const [newName, setNewName] = useState('');
+  const [newEmail, setNewEmail] = useState('');
   const add = async (e) => {
     e.preventDefault();
     if (!newName.trim()) return;
-    await onAdd(newName.trim());
-    setNewName('');
+    await onAdd(newName.trim(), newEmail.trim());
+    setNewName(''); setNewEmail('');
   };
   return (
     <Modal open onClose={onClose} title="メンバー管理" icon={<UserCog size={16} className="text-indigo-500" />}>
+      <p className="text-[11px] text-slate-400 mb-3">メールアドレスは、ほいさぽ等との連携キー（本人特定）になります。</p>
       <div className="space-y-2">
         {members.map((m) => (
-          <MemberRow key={m} name={m} accentMap={accentMap} onRename={onRename} onDelete={onDelete} />
+          <MemberRow key={m} name={m} email={memberEmails[m]} accentMap={accentMap}
+            onRename={onRename} onSetEmail={onSetEmail} onDelete={onDelete} />
         ))}
         {members.length === 0 && <p className="text-sm text-slate-400 py-4 text-center">メンバーがいません。下から追加してください。</p>}
       </div>
-
-      <form onSubmit={add} className="mt-5 pt-4 border-t border-slate-100">
-        <label className="block text-xs text-slate-400 mb-1">新しいメンバーを追加</label>
+      <form onSubmit={add} className="mt-5 pt-4 border-t border-slate-100 space-y-2">
+        <label className="block text-xs text-slate-400">新しいメンバーを追加</label>
+        <input type="text" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="表示名（例：山田 太郎）"
+          className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300" />
         <div className="flex gap-2">
-          <input type="text" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="例：営業D / 田中"
+          <input type="email" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder="メール（任意）"
             className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300" />
           <button type="submit" className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-3 py-2 rounded-lg">
             <Plus size={15} /> 追加
@@ -460,27 +460,6 @@ function MemberManagerModal({ members, accentMap, onAdd, onRename, onDelete, onC
         </div>
       </form>
     </Modal>
-  );
-}
-
-function MemberRow({ name, accentMap, onRename, onDelete }) {
-  const [draft, setDraft] = useState(name);
-  useEffect(() => { setDraft(name); }, [name]);
-  const commit = () => { if (draft.trim() && draft.trim() !== name) onRename(name, draft.trim()); };
-  return (
-    <div className="flex items-center gap-2">
-      <Avatar name={name} accentMap={accentMap} size={28} />
-      <input
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }}
-        className="flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
-      />
-      <button onClick={() => onDelete(name)} className="text-slate-300 hover:text-rose-500 p-1.5 rounded" title="削除">
-        <Trash2 size={16} />
-      </button>
-    </div>
   );
 }
 
@@ -519,8 +498,7 @@ function MemberProgress({ tasks, members, accentMap }) {
   return (
     <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
       <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-4">
-        <Users size={18} className="text-indigo-500" />
-        担当者別 進捗状況
+        <Users size={18} className="text-indigo-500" /> 担当者別 進捗状況
       </h3>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
         {groups.map((g) => {
@@ -531,9 +509,9 @@ function MemberProgress({ tasks, members, accentMap }) {
             <div key={g} className="border border-slate-100 rounded-lg p-4 bg-slate-50/50">
               <div className="flex items-center gap-2 mb-3">
                 <Avatar name={g} accentMap={accentMap} size={28} />
-                <span className="font-medium text-slate-700 text-sm">{g}</span>
+                <span className="font-medium text-slate-700 text-sm truncate">{g}</span>
                 {g === '未定' && mt.length > 0 && (
-                  <span className="ml-auto text-[11px] text-amber-600 bg-amber-50 ring-1 ring-amber-200 px-1.5 py-0.5 rounded">要割当 {mt.length}</span>
+                  <span className="ml-auto text-[11px] text-amber-600 bg-amber-50 ring-1 ring-amber-200 px-1.5 py-0.5 rounded shrink-0">要割当 {mt.length}</span>
                 )}
               </div>
               <ProgressBar done={done} total={mt.length} color={color} />
@@ -573,19 +551,22 @@ function SubTabs({ current, onChange, counts }) {
 /* ===================== 本体 ===================== */
 export default function Dashboard() {
   const { user, logout } = useAuth();
+  const { taskId } = useParams();
   const [tasks, setTasks] = useState([]);
   const [members, setMembers] = useState(DEFAULT_MEMBERS);
+  const [memberEmails, setMemberEmails] = useState(DEFAULT_MEMBER_EMAILS);
   const [guideline, setGuideline] = useState('');
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('全体');
   const [overviewSub, setOverviewSub] = useState('all');
   const [editingTask, setEditingTask] = useState(null);
   const [showMembers, setShowMembers] = useState(false);
+  const [autoFocused, setAutoFocused] = useState(false);
 
   const uid = user?.uid;
   const metaRef = () => doc(db, 'users', uid, 'meta', 'app');
 
-  // --- タスク購読 ---
+  // タスク購読
   useEffect(() => {
     if (!uid) return;
     const unsub = onSnapshot(
@@ -596,18 +577,19 @@ export default function Dashboard() {
     return unsub;
   }, [uid]);
 
-  // --- 設定（メンバー・行動指針）購読 ---
+  // 設定（メンバー・email・行動指針）購読
   useEffect(() => {
     if (!uid) return;
     const unsub = onSnapshot(doc(db, 'users', uid, 'meta', 'app'), (snap) => {
       const d = snap.exists() ? snap.data() : {};
       setMembers(Array.isArray(d.members) && d.members.length ? d.members : DEFAULT_MEMBERS);
+      setMemberEmails(d.memberEmails && typeof d.memberEmails === 'object' ? d.memberEmails : DEFAULT_MEMBER_EMAILS);
       setGuideline(typeof d.guideline === 'string' ? d.guideline : '');
     });
     return unsub;
   }, [uid]);
 
-  // --- 初回サンプル投入（空のときだけ・一度だけ） ---
+  // 初回サンプル投入
   useEffect(() => {
     if (!uid) return;
     const seedIfEmpty = async () => {
@@ -616,7 +598,7 @@ export default function Dashboard() {
       if (metaSnap.exists() && metaSnap.data().seeded) return;
       const tasksSnap = await getDocs(collection(db, 'users', uid, 'tasks'));
       if (!tasksSnap.empty) {
-        await setDoc(ref, { seeded: true, members: DEFAULT_MEMBERS }, { merge: true });
+        await setDoc(ref, { seeded: true, members: DEFAULT_MEMBERS, memberEmails: DEFAULT_MEMBER_EMAILS }, { merge: true });
         return;
       }
       const batch = writeBatch(db);
@@ -624,40 +606,62 @@ export default function Dashboard() {
         const tref = doc(collection(db, 'users', uid, 'tasks'));
         batch.set(tref, { ...t, createdAt: serverTimestamp() });
       });
-      batch.set(ref, { seeded: true, members: DEFAULT_MEMBERS, guideline: '' }, { merge: true });
+      batch.set(ref, { seeded: true, members: DEFAULT_MEMBERS, memberEmails: DEFAULT_MEMBER_EMAILS, guideline: '' }, { merge: true });
       await batch.commit();
     };
     seedIfEmpty().catch((e) => console.error('[seed]', e));
   }, [uid]);
 
-  // --- アクティブタブの整合性（メンバー削除/改名時） ---
+  // アクティブタブの整合性
   useEffect(() => {
     if (activeTab !== '全体' && !members.includes(activeTab)) setActiveTab('全体');
   }, [members, activeTab]);
 
+  // 連携：?from=hoisapo で来たら、ログイン中ユーザーの本人タブを自動表示（SSO要件）
+  useEffect(() => {
+    if (autoFocused || !user?.email) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('from') !== 'hoisapo') return;
+    const me = normalizeEmail(user.email);
+    const mine = members.find((m) => normalizeEmail(memberEmails[m]) === me);
+    if (mine) { setActiveTab(mine); setAutoFocused(true); }
+  }, [user, members, memberEmails, autoFocused]);
+
+  // ディープリンク：#/tasks/:id で来たら該当タスクの編集を開く
+  useEffect(() => {
+    if (!taskId || !tasks.length) return;
+    const t = tasks.find((x) => x.id === taskId);
+    if (t) setEditingTask(t);
+  }, [taskId, tasks]);
+
   const accentMap = useMemo(() => buildAccentMap(members), [members]);
   const assignees = useMemo(() => ['全体', ...members, '未定'], [members]);
 
-  // --- タスク CRUD ---
+  // タスク CRUD
   const addTask = (t) => addDoc(collection(db, 'users', uid, 'tasks'), { ...t, createdAt: serverTimestamp() });
   const changeStatus = (id, status) => updateDoc(doc(db, 'users', uid, 'tasks', id), { status });
   const changeAssignee = (id, assignee) => updateDoc(doc(db, 'users', uid, 'tasks', id), { assignee });
   const updateTask = (id, patch) => updateDoc(doc(db, 'users', uid, 'tasks', id), patch);
   const deleteTask = (id) => deleteDoc(doc(db, 'users', uid, 'tasks', id));
 
-  // --- 行動指針 ---
+  // 行動指針
   const saveGuideline = (text) => setDoc(metaRef(), { guideline: text, guidelineUpdatedAt: serverTimestamp() }, { merge: true });
 
-  // --- メンバー管理 ---
-  const addMember = async (name) => {
+  // メンバー管理（emailも同時に保持）
+  const addMember = async (name, email) => {
     if (members.includes(name) || SPECIAL.includes(name)) { alert('同じ名前、または予約語（全体／未定）は使えません。'); return; }
-    await setDoc(metaRef(), { members: [...members, name] }, { merge: true });
+    const nextEmails = { ...memberEmails };
+    if (email) nextEmails[name] = email;
+    await setDoc(metaRef(), { members: [...members, name], memberEmails: nextEmails }, { merge: true });
   };
+  const setMemberEmail = (name, email) => setDoc(metaRef(), { memberEmails: { ...memberEmails, [name]: email } }, { merge: true });
   const renameMember = async (oldName, newName) => {
     if (members.includes(newName) || SPECIAL.includes(newName)) { alert('同じ名前、または予約語（全体／未定）は使えません。'); return; }
     const newMembers = members.map((m) => (m === oldName ? newName : m));
+    const nextEmails = { ...memberEmails };
+    if (oldName in nextEmails) { nextEmails[newName] = nextEmails[oldName]; delete nextEmails[oldName]; }
     const batch = writeBatch(db);
-    batch.set(metaRef(), { members: newMembers }, { merge: true });
+    batch.set(metaRef(), { members: newMembers, memberEmails: nextEmails }, { merge: true });
     tasks.filter((t) => t.assignee === oldName).forEach((t) => batch.update(doc(db, 'users', uid, 'tasks', t.id), { assignee: newName }));
     await batch.commit();
     if (activeTab === oldName) setActiveTab(newName);
@@ -666,8 +670,10 @@ export default function Dashboard() {
     const cnt = tasks.filter((t) => t.assignee === name).length;
     if (!confirm(`「${name}」を削除します。${cnt > 0 ? `担当タスク${cnt}件は「未定」へ移動します。` : ''}よろしいですか？`)) return;
     const newMembers = members.filter((m) => m !== name);
+    const nextEmails = { ...memberEmails };
+    delete nextEmails[name];
     const batch = writeBatch(db);
-    batch.set(metaRef(), { members: newMembers }, { merge: true });
+    batch.set(metaRef(), { members: newMembers, memberEmails: nextEmails }, { merge: true });
     tasks.filter((t) => t.assignee === name).forEach((t) => batch.update(doc(db, 'users', uid, 'tasks', t.id), { assignee: '未定' }));
     await batch.commit();
     if (activeTab === name) setActiveTab('全体');
@@ -708,10 +714,8 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-slate-100">
-      {/* 行動指針（最上部・最も目立つ位置） */}
       <GuidelineBanner text={guideline} onSave={saveGuideline} />
 
-      {/* ヘッダー */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-10">
         <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -725,23 +729,19 @@ export default function Dashboard() {
           </div>
           <div className="flex items-center gap-3">
             <div className="hidden sm:flex items-center gap-2 text-sm text-slate-500">
-              <CalendarDays size={16} />
-              <span>{todayLabel}</span>
+              <CalendarDays size={16} /><span>{todayLabel}</span>
             </div>
             <button onClick={() => setShowMembers(true)}
               className="inline-flex items-center gap-2 text-sm text-slate-600 hover:text-indigo-600 border border-slate-200 hover:border-indigo-200 px-3 py-2 rounded-lg transition-colors">
-              <UserCog size={16} />
-              <span className="hidden sm:inline">メンバー管理</span>
+              <UserCog size={16} /><span className="hidden sm:inline">メンバー管理</span>
             </button>
             <button onClick={() => { if (confirm('ログアウトしますか？')) logout(); }}
               className="inline-flex items-center gap-2 text-sm text-slate-500 hover:text-rose-500 border border-slate-200 hover:border-rose-200 px-3 py-2 rounded-lg transition-colors">
-              <LogOut size={16} />
-              <span className="hidden sm:inline">ログアウト</span>
+              <LogOut size={16} /><span className="hidden sm:inline">ログアウト</span>
             </button>
           </div>
         </div>
 
-        {/* タブ（メンバーと連動） */}
         <div className="max-w-6xl mx-auto px-6">
           <nav className="flex gap-1 -mb-px overflow-x-auto">
             {tabs.map((tab) => {
@@ -760,12 +760,10 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* コンテンツ */}
       <main className="max-w-6xl mx-auto px-6 py-6 space-y-6">
         {loading ? (
           <div className="text-center py-24 text-slate-400 flex flex-col items-center gap-3">
-            <Loader size={28} className="animate-spin text-indigo-400" />
-            読み込み中...
+            <Loader size={28} className="animate-spin text-indigo-400" />読み込み中...
           </div>
         ) : activeTab === '全体' ? (
           <>
@@ -827,7 +825,7 @@ export default function Dashboard() {
                 <Avatar name={activeTab} accentMap={accentMap} size={40} text="text-sm" />
                 <div>
                   <h2 className="font-bold text-slate-800">{activeTab} さんのタスク</h2>
-                  <p className="text-xs text-slate-400">担当タスクの進捗</p>
+                  <p className="text-xs text-slate-400">{memberEmails[activeTab] || '担当タスクの進捗'}</p>
                 </div>
               </div>
               <ProgressBar
@@ -854,14 +852,13 @@ export default function Dashboard() {
         </footer>
       </main>
 
-      {/* モーダル */}
       {editingTask && (
         <TaskEditModal task={editingTask} assignees={assignees} onSave={updateTask} onClose={() => setEditingTask(null)} />
       )}
       {showMembers && (
         <MemberManagerModal
-          members={members} accentMap={accentMap}
-          onAdd={addMember} onRename={renameMember} onDelete={deleteMember}
+          members={members} memberEmails={memberEmails} accentMap={accentMap}
+          onAdd={addMember} onRename={renameMember} onSetEmail={setMemberEmail} onDelete={deleteMember}
           onClose={() => setShowMembers(false)}
         />
       )}
